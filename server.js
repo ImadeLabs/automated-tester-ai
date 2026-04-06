@@ -1,85 +1,91 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const puppeteer = require("puppeteer"); // ✅ Replaced Cheerio
+const puppeteer = require("puppeteer");
 const cors = require("cors");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" })); // Increased limit for image data
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
-// 🔹 Scrape website using Puppeteer (Multimodal/Visual Render)
+// ✅ FIX: Root route to prevent "Cannot GET /" and handle Render health checks
+app.get("/", (req, res) => {
+  res.send("AI QA Agent Backend is Running 🚀");
+});
+
+// 🔹 Multimodal Scraping (Text + Screenshot)
 async function scrapeWebsite(url) {
   let browser;
   try {
-    // On Render, we often need these args to run puppeteer correctly
     browser = await puppeteer.launch({
       headless: "new",
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
     
     const page = await browser.newPage();
-    
-    // Set a standard viewport
     await page.setViewport({ width: 1280, height: 800 });
-
-    // Navigate to URL and wait until network is idle (important for React apps)
+    
+    // Increased timeout for heavy sites
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-    // ✅ OPTIONAL: Take a screenshot for future multimodal analysis
-    // const screenshot = await page.screenshot({ encoding: 'base64' });
+    // ✅ MULTIMODAL STEP: Capture Screenshot as Base64
+    const screenshot = await page.screenshot({ 
+        encoding: "base64",
+        type: "jpeg",
+        quality: 70 // Compressed for faster API transmission
+    });
 
-    // Extract visible text from the page
+    // Extract text
     const text = await page.evaluate(() => document.body.innerText);
 
     await browser.close();
-    
-    // Clean and trim text to stay within token limits
-    return text.replace(/\s+/g, " ").trim().substring(0, 4000);
+    return { 
+        text: text.replace(/\s+/g, " ").trim().substring(0, 3000), 
+        screenshot 
+    };
   } catch (error) {
     if (browser) await browser.close();
     console.error("Puppeteer Error:", error.message);
-    throw new Error("Failed to render page");
+    throw error;
   }
 }
 
-// 🔹 Call Oxlo API
-async function generateTests(content) {
+// 🔹 Multimodal AI Call (DeepSeek Vision)
+async function generateTests(content, screenshotBase64) {
   try {
     const response = await axios.post(
       "https://api.oxlo.ai/v1/chat/completions",
       {
-        model: "deepseek-v3.2",
+        model: "deepseek-v3.2", 
         messages: [
           {
             role: "system",
-            content: "You are a senior QA automation engineer. Analyze the provided webpage content and generate high-quality testing documentation.",
+            content: "You are a senior QA automation engineer. Analyze both the text and the visual screenshot provided.",
           },
           {
             role: "user",
-            content: `
-Analyze this webpage and respond STRICTLY in valid JSON.
-Return ONLY this structure:
-{
-  "test_cases": ["..."],
-  "edge_cases": ["..."],
-  "cypress_code": "...",
-  "bugs": ["..."],
-  "auth_detected": true
-}
-
-Rules:
-- test_cases: functional user flows
-- edge_cases: unusual/failure scenarios
-- cypress_code: complete Cypress test file (.cy.js format)
-- bugs: UI/UX issues or missing labels
-- auth_detected: true if login/signup exists
-
-Content:
-${content}
-          `,
+            content: [
+              { 
+                type: "text", 
+                text: `Analyze this webpage and respond STRICTLY in valid JSON.
+                Return this structure:
+                {
+                  "test_cases": ["..."],
+                  "edge_cases": ["..."],
+                  "cypress_code": "...",
+                  "bugs": ["..."],
+                  "auth_detected": true
+                }
+                
+                Content: ${content}` 
+              },
+              { 
+                type: "image_url", 
+                image_url: { url: `data:image/jpeg;base64,${screenshotBase64}` } 
+              }
+            ],
           },
         ],
       },
@@ -92,14 +98,12 @@ ${content}
     );
 
     const raw = response.data.choices[0].message.content;
-
-    // Clean potential markdown formatting if AI includes it
     const cleanJson = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     return JSON.parse(cleanJson);
 
   } catch (err) {
-    console.error("AI/JSON Error:", err.message);
-    return { error: "AI processing failed", details: err.message };
+    console.error("AI Error:", err.response?.data || err.message);
+    throw new Error("AI Vision Analysis Failed");
   }
 }
 
@@ -107,13 +111,15 @@ ${content}
 app.post("/analyze", async (req, res) => {
   try {
     const { url } = req.body;
-
     if (!url || !url.startsWith("http")) {
       return res.status(400).json({ error: "Invalid URL" });
     }
 
-    const content = await scrapeWebsite(url);
-    const result = await generateTests(content);
+    // Get Text + Image
+    const { text, screenshot } = await scrapeWebsite(url);
+    
+    // Send both to AI
+    const result = await generateTests(text, screenshot);
 
     res.json(result);
   } catch (error) {
